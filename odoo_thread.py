@@ -16,10 +16,10 @@ class Odoo_Thread(object):
     thread_list = []
     # 正在运行的线程
     running_thread = []
-    # 线程是否出错，暂时没用
+    # 线程是否出错
     is_failed = 0
 
-    def __init__(self, dbname, table_name, user_id, over_callback=False, error_callback=False):
+    def __init__(self, dbname, table_name, user_id, retry_times=3, retry_delay=10, delay_time=4, over_callback=False, error_callback=False):
         """
         初始化进程管理类
         :param dbname: 数据库名称
@@ -35,6 +35,9 @@ class Odoo_Thread(object):
         self.over_callback = over_callback
         self.error_callback = error_callback
         self._Max_Running_Threads = 5  # 最大运行线程数
+        self.retry_delay = retry_delay
+        self.retry_times = retry_times
+        self.delay_time = delay_time
 
     # 所有的进程是否跑完了
     @staticmethod
@@ -54,21 +57,23 @@ class Odoo_Thread(object):
         """
         if isinstance(name_target, dict):
             for key, val in name_target.items():
-                val = tuple(val)
-                if val and val[0]:
-                    arg = val[1] if len(val) > 1 else ()
-                    if not isinstance(arg, tuple):
-                        arg = tuple([arg])
+                if key == 'error_callback':
+                    self.error_callback = val
+                elif key == 'over_callback':
+                    self.over_callback = val
+                elif val and val[0]:
+                    arg = val[1] if len(val) > 1 else {}
                     daemon = val[2] if len(val) > 2 else False
                     t = self.new_thread(dbname=self.dbname, table_name=self.table_name, user_id=self.user_id,
-                                        target=val[0], args=arg)
+                                        retry_times=self.retry_times, retry_delay=self.retry_delay,
+                                        delay_time=self.delay_time, target=val[0], args=arg)
                     t.setDaemon(daemon)
                     t.stop_callback(self._move_self_start_new, self)
                     self._put_thread(t)
 
     # 添加线程到线程集合中
     def _put_thread(self, t):
-        if isinstance(t, threading.Thread):
+        if isinstance(t, MyThread):
             if t in Odoo_Thread.thread_list:
                 _logger.warning(u'already exist')
                 return True
@@ -87,11 +92,14 @@ class Odoo_Thread(object):
                     Odoo_Thread.running_thread.append(t_new)
                 elif len(Odoo_Thread.running_thread) == 0 and cls.over_callback and Odoo_Thread.is_failed == 0:
                     # 执行完成回调
-                    cls.over_callback()
-                elif Odoo_Thread.is_failed != 0 and cls.error_callback:
+                    if callable(cls.over_callback):
+                        cls.over_callback()
+                elif Odoo_Thread.is_failed != 0 and cls.error_callback and t.is_failed:
                     # TODO 失败回调，要保证一个失败后，所有未执行的线程都不执行，所有执行的线程尝试结束
                     if callable(cls.error_callback):
-                        cls.error_callback()
+                        t = Odoo_Thread.new_thread(dbname=cls.dbname, table_name=cls.table_name, user_id=cls.user_id,
+                                                   target=cls.error_callback, args=t.kwargs['args'])
+                        t.start()
                     for i in Odoo_Thread.running_thread:
                         i.join(0.05)
                         time.sleep(0.05)
@@ -101,10 +109,15 @@ class Odoo_Thread(object):
     def start_all(self):
         if Odoo_Thread.LOCK.acquire():
             while True:
-                t = Odoo_Thread.thread_list.pop()
-                t.start()
-                if len(Odoo_Thread.running_thread) < self._Max_Running_Threads:
-                    Odoo_Thread.running_thread.append(t)
+                if len(Odoo_Thread.thread_list) > 0:
+                    t = Odoo_Thread.thread_list.pop()
+                    t.start()
+                    if len(Odoo_Thread.running_thread) < self._Max_Running_Threads:
+                        Odoo_Thread.running_thread.append(t)
+                    else:
+                        # 释放线程锁
+                        Odoo_Thread.LOCK.release()
+                        break
                 else:
                     # 释放线程锁
                     Odoo_Thread.LOCK.release()
@@ -128,42 +141,36 @@ class Odoo_Thread(object):
             table_name = kwargs['table_name']
             user_id = kwargs['user_id']
             target = kwargs['target']
-            callback = False
-            if 'callback' in kwargs:
-                callback = kwargs['callback']
             delay_time = 4
             if 'delay_time' in kwargs:
                 delay_time = kwargs['delay_time']
             retry_times = 3
             if 'retry_times' in kwargs:
-                retry_times = kwargs['delay_time']
-            retry_delay = 60
+                retry_times = kwargs['retry_times']
+            retry_delay = 10
             if 'retry_delay' in kwargs:
                 retry_delay = kwargs['retry_delay']
             time.sleep(delay_time)
             cls = odoo.registry(dbname)[table_name]
             while retry_times >= 0:
-                try:
-                    with cls.pool.cursor() as cr:
-                        with odoo.api.Environment.manage():
+                with cls.pool.cursor() as cr:
+                    with odoo.api.Environment.manage():
+                        try:
                             self = odoo.api.Environment(cr, user_id, {})[table_name]
                             if 'args' in kwargs:
                                 target(self, **kwargs['args'])
                             else:
                                 target(self)
                             retry_times = -1
-                            if callable(callback):
-                                if 'args' in kwargs:
-                                    callback(self, **kwargs['args'])
-                                else:
-                                    callback(self)
-                except Exception, e:
-                    _logger.error(e)
-                    retry_times -= 1
-                    if retry_times >= 0:
-                        time.sleep(retry_delay)
-                    else:
-                        Odoo_Thread.is_failed += 1
+                        except Exception, e:
+                            cr.rollback()
+                            _logger.error(e)
+                            retry_times -= 1
+                            if retry_times >= 0:
+                                time.sleep(retry_delay)
+                            else:
+                                Odoo_Thread.is_failed += 1
+                                raise e
 
         return MyThread(target=reback_target, args=(kwargs,))
 
@@ -174,9 +181,14 @@ class MyThread(threading.Thread):
         super(MyThread, self).__init__(**kwargs)
         self.callback = False
         self.thread_contral = False
+        self.is_failed = False
+        self.kwargs = kwargs['args'][0]
 
     def run(self):
-        super(MyThread, self).run()
+        try:
+            super(MyThread, self).run()
+        except Exception:
+            self.is_failed = True
         self.__stop__()
 
     def stop_callback(self, callback, arg):
@@ -186,4 +198,3 @@ class MyThread(threading.Thread):
     def __stop__(self):
         if self.callback:
             self.callback(self.thread_contral, self)
-
