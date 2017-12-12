@@ -187,8 +187,9 @@ class MyThread(threading.Thread):
     def run(self):
         try:
             super(MyThread, self).run()
-        except Exception:
+        except Exception, e:
             self.is_failed = True
+            self.kwargs['args']['__exception'] = e
         self.__stop__()
 
     def stop_callback(self, callback, arg):
